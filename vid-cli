@@ -1,0 +1,1509 @@
+#!/bin/sh
+# vid-cli - search, play and download YouTube videos; browse anime metadata.
+# POSIX shell; no eval; all YouTube access is delegated to yt-dlp.
+set -u
+
+PROG=vid-cli
+VERSION=1.0.0
+
+# ------------------------------- defaults ----------------------------------
+
+MODE=youtube
+QUALITY=720
+AUDIO=0
+DOWNLOAD=0
+NUM_RESULTS=${VID_CLI_RESULTS:-15}
+CONTINUE=0
+SUBS=0
+SUBS_LANG=en
+SORT=relevance
+USE_HISTORY=1
+
+PLAYER=${VID_CLI_PLAYER:-mpv}
+PLAYER_KIND=mpv
+EXTERNAL_MENU=${VID_CLI_EXTERNAL_MENU:-0}
+VID_CLI_YTDLP_ARGS=${VID_CLI_YTDLP_ARGS:-}
+
+DL_DIR=${VID_CLI_DL_DIR:-$HOME/Videos/vid-cli}
+HIST_DIR=${VID_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/vid-cli}
+HISTFILE=$HIST_DIR/histfile
+CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/vid-cli
+
+TMP_WORK=
+ANILIST_TMP_OUT=
+ANILIST_TMP_HDR=
+HIST_TMP=
+QUERY=
+SUB_FILE=
+ANILIST_TTL=600
+YT_LIST_LIMIT=100
+
+TAB=$(printf '\t')
+YT_PRINT_FMT="%(id)s${TAB}%(title)s${TAB}%(channel,uploader,channel_id)s${TAB}%(duration_string,duration)s${TAB}%(view_count)s${TAB}%(upload_date)s"
+
+# -------------------------------- output -----------------------------------
+
+if [ -t 1 ] && [ "${NO_COLOR+set}" != set ]; then
+    _esc=$(printf '\033')
+    C_RESET="${_esc}[0m"
+    C_BOLD="${_esc}[1m"
+    C_RED="${_esc}[31m"
+    C_YELLOW="${_esc}[33m"
+else
+    C_RESET=
+    C_BOLD=
+    C_RED=
+    C_YELLOW=
+fi
+
+msg() {
+    printf '%s%s:%s %s\n' "$C_BOLD" "$PROG" "$C_RESET" "$*" >&2
+}
+
+warn() {
+    printf '%s%s: %s%s\n' "$C_YELLOW" "$PROG" "$*" "$C_RESET" >&2
+}
+
+die() {
+    _code=$1
+    shift
+    printf '%s%s: %s%s\n' "$C_RED" "$PROG" "$*" "$C_RESET" >&2
+    exit "$_code"
+}
+
+cleanup() {
+    if [ -n "${TMP_WORK:-}" ] && [ -d "$TMP_WORK" ]; then
+        rm -rf "$TMP_WORK"
+    fi
+    [ -z "${ANILIST_TMP_OUT:-}" ] || rm -f "$ANILIST_TMP_OUT"
+    [ -z "${ANILIST_TMP_HDR:-}" ] || rm -f "$ANILIST_TMP_HDR"
+    [ -z "${HIST_TMP:-}" ] || rm -f "$HIST_TMP"
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  vid-cli [options] QUERY | URL
+  vid-cli [options]                      open the startup page
+  vid-cli [options] -c
+  vid-cli --anime [options] TITLE
+  vid-cli -h | -V | -U
+
+YouTube options:
+  -q, --quality LEVEL   360, 480, 720, 1080, best or worst (default: 720)
+  -a, --audio           audio only
+  -d, --download        download instead of playing
+  -n, --number N        number of search results (default: 15)
+  -c, --continue        choose an item from history
+      --subs[=LANG]     load subtitles if available (default: en)
+      --sort MODE       relevance, date or views (default: relevance)
+      --no-history      do not write to the history file
+  -v, --vlc             use VLC instead of mpv (both play yt-dlp-resolved streams)
+      --anime           anime mode, metadata from AniList
+  -h, --help            show this help
+  -V, --version         show version
+  -U, --update          show update instructions (does not self-modify)
+      --                end option parsing
+
+Environment:
+  VID_CLI_PLAYER        player binary (default: mpv)
+  VID_CLI_DL_DIR        download directory (default: $HOME/Videos/vid-cli)
+  VID_CLI_HIST_DIR      state directory (default: ${XDG_STATE_HOME:-$HOME/.local/state}/vid-cli)
+  VID_CLI_RESULTS       default number of search results (default: 15)
+  VID_CLI_EXTERNAL_MENU 1 to use rofi instead of fzf
+  VID_CLI_YTDLP_ARGS    extra yt-dlp arguments, whitespace-separated
+  NO_COLOR              disable ANSI colors when set (even to an empty value)
+
+Paste a youtube.com, youtu.be or music.youtube.com URL to open a video,
+playlist or channel. Playlists and channels show a multi-select menu.
+
+Run with no query to open the startup menu. Without a terminal (for
+example in a script), that case prints this help and exits 1.
+
+Exit status: 0 ok, 1 usage, 2 missing dependency, 3 network/API error,
+             4 nothing found.
+EOF
+}
+
+update_help() {
+    cat <<'EOF'
+vid-cli does not update itself.
+
+To update vid-cli, download the newest vid-cli script and replace this file
+(or "git pull" if you use a checkout).
+
+Many playback failures are fixed by updating yt-dlp:
+  apt:    sudo apt update && sudo apt install yt-dlp
+  brew:   brew upgrade yt-dlp
+  pacman: sudo pacman -Syu yt-dlp
+  Termux: pkg upgrade yt-dlp
+  pip:    python -m pip install -U yt-dlp
+EOF
+}
+
+# ------------------------------ argument parsing ---------------------------
+
+add_query() {
+    if [ -z "$QUERY" ]; then
+        QUERY=$1
+    else
+        QUERY="$QUERY $1"
+    fi
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -V|--version)
+                printf '%s %s\n' "$PROG" "$VERSION"
+                exit 0
+                ;;
+            -U|--update)
+                update_help
+                exit 0
+                ;;
+            --anime)
+                MODE=anime
+                ;;
+            -q|--quality)
+                [ "$#" -ge 2 ] || die 1 "option $1 requires an argument"
+                QUALITY=$2
+                shift
+                ;;
+            --quality=*)
+                QUALITY=${1#*=}
+                ;;
+            -a|--audio)
+                AUDIO=1
+                ;;
+            -d|--download)
+                DOWNLOAD=1
+                ;;
+            -n|--number)
+                [ "$#" -ge 2 ] || die 1 "option $1 requires an argument"
+                case $2 in
+                    ''|*[!0-9]*) die 1 "invalid result count: $2" ;;
+                esac
+                NUM_RESULTS=$2
+                shift
+                ;;
+            --number=*)
+                NUM_RESULTS=${1#*=}
+                ;;
+            -c|--continue)
+                CONTINUE=1
+                ;;
+            --subs)
+                SUBS=1
+                if [ "$#" -ge 2 ]; then
+                    case $2 in
+                        [A-Za-z][A-Za-z]|[A-Za-z][A-Za-z][A-Za-z]|[A-Za-z][A-Za-z][,-]*)
+                            SUBS_LANG=$2
+                            shift
+                            ;;
+                    esac
+                fi
+                ;;
+            --subs=*)
+                SUBS=1
+                SUBS_LANG=${1#*=}
+                ;;
+            --sort)
+                [ "$#" -ge 2 ] || die 1 "option --sort requires an argument"
+                SORT=$2
+                shift
+                ;;
+            --sort=*)
+                SORT=${1#*=}
+                ;;
+            --no-history)
+                USE_HISTORY=0
+                ;;
+            -v|--vlc)
+                PLAYER=vlc
+                ;;
+            --)
+                shift
+                while [ "$#" -gt 0 ]; do
+                    add_query "$1"
+                    shift
+                done
+                break
+                ;;
+            -*)
+                die 1 "unknown option: $1 (try --help)"
+                ;;
+            *)
+                add_query "$1"
+                ;;
+        esac
+        shift
+    done
+
+    case $QUALITY in
+        360|480|720|1080|best|worst) ;;
+        *) die 1 "invalid quality: $QUALITY (use 360, 480, 720, 1080, best or worst)" ;;
+    esac
+
+    case $SORT in
+        relevance|date|views) ;;
+        *) die 1 "invalid sort: $SORT (use relevance, date or views)" ;;
+    esac
+
+    case $NUM_RESULTS in
+        ''|*[!0-9]*) die 1 "invalid result count: $NUM_RESULTS" ;;
+    esac
+    [ "$NUM_RESULTS" -gt 0 ] || die 1 "result count must be greater than zero"
+
+    case $SUBS_LANG in
+        ''|*[!A-Za-z0-9_,.-]*) die 1 "invalid subtitle language: $SUBS_LANG" ;;
+    esac
+
+    case $EXTERNAL_MENU in
+        0|1) ;;
+        *)
+            warn "VID_CLI_EXTERNAL_MENU must be 0 or 1; using fzf"
+            EXTERNAL_MENU=0
+            ;;
+    esac
+
+    case $(basename "$PLAYER" 2>/dev/null) in
+        *vlc*) PLAYER_KIND=vlc ;;
+        *) PLAYER_KIND=mpv ;;
+    esac
+}
+
+# ------------------------------- dependencies ------------------------------
+
+check_deps() {
+    _missing=
+    for _dep in curl jq yt-dlp fzf; do
+        command -v "$_dep" >/dev/null 2>&1 || _missing="$_missing $_dep"
+    done
+    command -v "$PLAYER" >/dev/null 2>&1 || _missing="$_missing $PLAYER"
+
+    if [ -n "$_missing" ]; then
+        _missing=${_missing# }
+        printf '%s%s: missing dependencies:%s %s\n' \
+            "$C_RED" "$PROG" "$C_RESET" "$_missing" >&2
+        printf 'Install hints:\n' >&2
+        printf '  apt:    sudo apt install %s\n' "$_missing" >&2
+        printf '  brew:   brew install %s\n' "$_missing" >&2
+        printf '  pacman: sudo pacman -S %s\n' "$_missing" >&2
+        printf '  Termux: pkg install %s\n' "$_missing" >&2
+        exit 2
+    fi
+
+    if [ "$EXTERNAL_MENU" = 1 ] && ! command -v rofi >/dev/null 2>&1; then
+        warn "rofi not found; falling back to fzf"
+        EXTERNAL_MENU=0
+    fi
+}
+
+init_work() {
+    mkdir -p "$CACHE_DIR" 2>/dev/null ||
+        die 1 "cannot create cache directory: $CACHE_DIR"
+    TMP_WORK=$(mktemp -d "$CACHE_DIR/tmp.XXXXXX") ||
+        die 1 "cannot create temporary directory in $CACHE_DIR"
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+}
+
+# ------------------------------ helpers ------------------------------------
+
+# Split VID_CLI_YTDLP_ARGS on whitespace (documented). Globbing is disabled so
+# a stray "*" is passed literally; every other expansion is quoted.
+ytdlp() {
+    set -f
+    # shellcheck disable=SC2086
+    set -- $VID_CLI_YTDLP_ARGS "$@"
+    set +f
+    yt-dlp "$@"
+}
+
+# Native programs do not understand MSYS/Cygwin "/c/..." paths inside
+# option values. Convert POSIX absolute paths to mixed Windows paths.
+native_path() {
+    case $1 in
+        /*)
+            case "$(uname -s 2>/dev/null)" in
+                MINGW*|MSYS*|CYGWIN*)
+                    if command -v cygpath >/dev/null 2>&1; then
+                        cygpath -m "$1"
+                        return
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+    printf '%s\n' "$1"
+}
+
+is_youtube_url() {
+    case $1 in
+        https://youtu.be/?*|http://youtu.be/?*|\
+        https://youtube.com/*|http://youtube.com/*|\
+        https://www.youtube.com/*|http://www.youtube.com/*|\
+        https://m.youtube.com/*|http://m.youtube.com/*|\
+        https://music.youtube.com/*|http://music.youtube.com/*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+normalize_url() {
+    case $1 in
+        youtu.be/*|youtube.com/*|www.youtube.com/*|m.youtube.com/*|music.youtube.com/*)
+            printf 'https://%s\n' "$1"
+            ;;
+        *)
+            printf '%s\n' "$1"
+            ;;
+    esac
+}
+
+video_url() {
+    case $1 in
+        '') return 1 ;;
+        http://*|https://*)
+            if is_youtube_url "$1"; then
+                printf '%s\n' "$1"
+                return 0
+            fi
+            return 1
+            ;;
+    esac
+    case $1 in
+        *[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    printf 'https://www.youtube.com/watch?v=%s\n' "$1"
+}
+
+clean_field() {
+    printf '%s' "$1" | tr '\t\n\r' '   '
+}
+
+# One menu wrapper for fzf and rofi. Input and output are lines of
+# "id<TAB>display"; fzf hides the id, rofi shows the whole line.
+pick() {
+    _pick_prompt=${1:-Select}
+    _pick_multi=${2:-0}
+    if [ "$EXTERNAL_MENU" = 1 ]; then
+        if [ "$_pick_multi" = 1 ]; then
+            rofi -dmenu -i -no-custom -multi-select -p "$_pick_prompt"
+        else
+            rofi -dmenu -i -no-custom -p "$_pick_prompt"
+        fi
+        return $?
+    fi
+    if [ "$_pick_multi" = 1 ]; then
+        fzf --delimiter='\t' --with-nth=2.. --nth=2.. \
+            --prompt="$_pick_prompt> " --reverse --cycle --multi
+    else
+        fzf --delimiter='\t' --with-nth=2.. --nth=2.. \
+            --prompt="$_pick_prompt> " --reverse --cycle --no-multi
+    fi
+}
+
+# Free-text prompt using the same menu backend as pick(). fzf's --print-query
+# prints the typed line first; --phony means there is nothing to filter.
+ask() {
+    _ask_prompt=${1:-Search}
+    if [ "$EXTERNAL_MENU" = 1 ]; then
+        rofi -dmenu -i -p "$_ask_prompt" </dev/null | sed -n '1p' | tr -d '\r'
+        return 0
+    fi
+    fzf --print-query --phony --prompt="$_ask_prompt> " \
+        --header='Type a query, then press Enter' </dev/null |
+        sed -n '1p' | tr -d '\r'
+    return 0
+}
+
+# Raw yt-dlp TSV -> "id<TAB>title | channel | duration | views | date".
+format_entries() {
+    awk -F "$TAB" -v OFS="$TAB" '
+        function clean(s) { gsub(/[\t\r\n]/, " ", s); return s }
+        function pad2(n) { return n < 10 ? "0" n : n "" }
+        function fmt_dur(s,   n, h, m, sec) {
+            if (s == "" || s == "NA" || s == "None" || s == "null") return "?"
+            if (s ~ /^[0-9]+$/) {
+                n = s + 0
+                h = int(n / 3600)
+                m = int((n % 3600) / 60)
+                sec = n % 60
+                if (h > 0) return h ":" pad2(m) ":" pad2(sec)
+                return m ":" pad2(sec)
+            }
+            return s
+        }
+        function trimf(x,   s) {
+            s = sprintf("%.1f", x)
+            sub(/\.0$/, "", s)
+            return s
+        }
+        function fmt_views(v,   n) {
+            if (v == "" || v == "NA" || v == "None" || v == "null") return "?"
+            if (v !~ /^[0-9]/) return "?"
+            n = v + 0
+            if (n >= 1000000000) return trimf(n / 1000000000) "B"
+            if (n >= 1000000) return trimf(n / 1000000) "M"
+            if (n >= 1000) return trimf(n / 1000) "K"
+            return sprintf("%d", n)
+        }
+        function fmt_date(d) {
+            if (d ~ /^[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]$/)
+                return substr(d, 1, 4) "-" substr(d, 5, 2) "-" substr(d, 7, 2)
+            if (d == "" || d == "NA" || d == "None" || d == "null") return "?"
+            return d
+        }
+        {
+            if ($1 == "") next
+            title = clean($2)
+            channel = clean($3)
+            if (channel == "" || channel == "NA" || channel == "null") channel = "?"
+            print clean($1), title " | " channel " | " fmt_dur($4) \
+                " | " fmt_views($5) " | " fmt_date($6)
+        }'
+}
+
+# A flat list from yt-dlp. --print keeps this to one process per request.
+yt_list() {
+    _yt_target=$1
+    _yt_limit=${2:-$YT_LIST_LIMIT}
+    ytdlp --flat-playlist --playlist-end "$_yt_limit" \
+        --no-warnings --ignore-errors \
+        --replace-in-metadata title '[\t\r\n]+' ' ' \
+        --replace-in-metadata channel '[\t\r\n]+' ' ' \
+        --replace-in-metadata uploader '[\t\r\n]+' ' ' \
+        --print "$YT_PRINT_FMT" "$_yt_target"
+}
+
+# ------------------------------- YouTube -----------------------------------
+
+yt_search() {
+    _query=$1
+    _raw=$TMP_WORK/search.raw
+    _err=$TMP_WORK/search.err
+
+    case $SORT in
+        date) _target="ytsearchdate${NUM_RESULTS}:${_query}" ;;
+        *) _target="ytsearch${NUM_RESULTS}:${_query}" ;;
+    esac
+
+    yt_list "$_target" "$NUM_RESULTS" >"$_raw" 2>"$_err"
+    _rc=$?
+
+    if [ ! -s "$_raw" ]; then
+        if [ -s "$_err" ]; then
+            cat "$_err" >&2
+        fi
+        if [ "$_rc" -ne 0 ]; then
+            msg "YouTube request failed; check your connection and update yt-dlp."
+            return 3
+        fi
+        msg "No videos found for: $_query"
+        return 4
+    fi
+
+    if [ "$SORT" = views ]; then
+        msg "sorting by views on the client; YouTube search has no views filter"
+        LC_ALL=C sort -t "$TAB" -k5,5nr "$_raw" >"$_raw.sorted"
+        mv "$_raw.sorted" "$_raw"
+    elif [ "$SORT" = date ]; then
+        msg "sorted by upload date using the YouTube search filter"
+    fi
+
+    format_entries <"$_raw"
+}
+
+yt_expand_url() {
+    _url=$1
+    _raw=$TMP_WORK/expand.raw
+    _err=$TMP_WORK/expand.err
+
+    yt_list "$_url" >"$_raw" 2>"$_err"
+    _rc=$?
+    if [ ! -s "$_raw" ]; then
+        if [ -s "$_err" ]; then
+            cat "$_err" >&2
+        fi
+        if [ "$_rc" -ne 0 ]; then
+            msg "Could not read that URL; it may be private, age-restricted, region-locked or removed."
+            return 3
+        fi
+        msg "No playable entries found; it may be empty, private, age-restricted, region-locked or removed."
+        return 4
+    fi
+
+    _count=$(wc -l <"$_raw" | tr -d ' ')
+    if [ "$_count" -le 1 ]; then
+        _id=$(cut -f1 "$_raw")
+        _title=$(cut -f2 "$_raw")
+        if ! _vurl=$(video_url "$_id"); then
+            msg "yt-dlp returned an unexpected video id; refusing to use it."
+            return 3
+        fi
+        hist_add youtube "$_vurl" "$_title"
+        if [ "$DOWNLOAD" = 1 ]; then
+            download "$_vurl" "$_title"
+            return $?
+        fi
+        play "$_vurl" "$_title"
+        return $?
+    fi
+
+    while :; do
+        if ! _sel=$(format_entries <"$_raw" |
+            pick "Select videos (TAB marks, ENTER confirms)" 1); then
+            return 0
+        fi
+        [ -n "$_sel" ] || continue
+
+        printf '%s\n' "$_sel" >"$TMP_WORK/picked.tsv"
+        : >"$TMP_WORK/queue.tsv"
+        while IFS= read -r _line; do
+            _id=$(printf '%s\n' "$_line" | cut -f1)
+            _disp=$(printf '%s\n' "$_line" | cut -f2-)
+            if ! _vurl=$(video_url "$_id"); then
+                warn "skipping an entry with a malformed id"
+                continue
+            fi
+            printf '%s\t%s\n' "$_vurl" "$_disp" >>"$TMP_WORK/queue.tsv"
+        done <"$TMP_WORK/picked.tsv"
+
+        if [ ! -s "$TMP_WORK/queue.tsv" ]; then
+            msg "No valid videos selected."
+            return 4
+        fi
+
+        if [ "$DOWNLOAD" = 1 ]; then
+            _fail=0
+            while IFS="$TAB" read -r _vurl _disp; do
+                hist_add youtube "$_vurl" "$_disp"
+                download "$_vurl" "$_disp" || _fail=1
+            done <"$TMP_WORK/queue.tsv"
+            [ "$_fail" -eq 0 ] || return 3
+            return 0
+        fi
+
+        while IFS="$TAB" read -r _vurl _disp; do
+            hist_add youtube "$_vurl" "$_disp"
+        done <"$TMP_WORK/queue.tsv"
+
+        play_queue "$TMP_WORK/queue.tsv"
+        _qrc=$?
+        [ "$_qrc" -eq 2 ] && continue
+        return "$_qrc"
+    done
+}
+
+# ---------------------------- play and download ----------------------------
+
+yt_format() {
+    if [ "$AUDIO" = 1 ]; then
+        printf '%s\n' 'bestaudio/best'
+        return 0
+    fi
+    case $QUALITY in
+        best) printf '%s\n' 'bv*+ba/b' ;;
+        worst) printf '%s\n' 'worst' ;;
+        *) printf '%s\n' "bv*[height<=${QUALITY}]+ba/b[height<=${QUALITY}]/b" ;;
+    esac
+}
+
+# A single-file format for VLC and for downloads when ffmpeg is absent.
+single_format() {
+    if [ "$AUDIO" = 1 ]; then
+        printf '%s\n' 'ba/b'
+        return 0
+    fi
+    case $QUALITY in
+        best) printf '%s\n' 'b' ;;
+        worst) printf '%s\n' 'w' ;;
+        *) printf '%s\n' "b[height<=${QUALITY}]/b" ;;
+    esac
+}
+
+fetch_subtitles() {
+    SUB_FILE=
+    [ "$SUBS" = 1 ] || return 0
+    [ "$AUDIO" = 0 ] || return 0
+    _sub_out="$(native_path "$TMP_WORK")/subtitle.%(ext)s"
+    ytdlp --quiet --no-warnings --skip-download --no-playlist \
+        --write-subs --write-auto-subs --sub-langs "$SUBS_LANG" \
+        --sub-format vtt -o "$_sub_out" "$1" \
+        >/dev/null 2>&1 || true
+    for _sub in "$TMP_WORK"/subtitle.*; do
+        [ -f "$_sub" ] || continue
+        SUB_FILE=$_sub
+        break
+    done
+}
+
+play() {
+    _url=$1
+    _title=${2:-$1}
+    msg "playing: $_title"
+    SUB_FILE=
+    fetch_subtitles "$_url"
+
+    if [ "$PLAYER_KIND" = vlc ]; then
+        _fmt=$(single_format)
+        _stream=$(ytdlp --no-playlist -f "$_fmt" -g "$_url" 2>"$TMP_WORK/vlc.err" |
+            sed -n '1p' | tr -d '\r')
+        if [ -z "$_stream" ]; then
+            if [ -s "$TMP_WORK/vlc.err" ]; then
+                cat "$TMP_WORK/vlc.err" >&2
+            fi
+            msg "yt-dlp could not resolve a single-file stream for VLC; try mpv or --quality best."
+            return 3
+        fi
+        set -- --play-and-exit
+        if [ "$AUDIO" = 1 ]; then
+            set -- "$@" --no-video
+        elif [ -n "$SUB_FILE" ]; then
+            set -- "$@" "--sub-file=$(native_path "$SUB_FILE")"
+        fi
+        "$PLAYER" "$@" "$_stream"
+        _rc=$?
+    else
+        # Resolve here instead of relying on mpv's ytdl hook: the hook probes
+        # the page URL first and older mpv builds cannot mux video+audio.
+        _fmt=$(yt_format)
+        _streams=$(ytdlp --no-playlist -f "$_fmt" -g "$_url" 2>"$TMP_WORK/mpv.err")
+        _resolve_rc=$?
+        if [ "$_resolve_rc" -ne 0 ] || [ -z "$_streams" ]; then
+            if [ -s "$TMP_WORK/mpv.err" ]; then
+                cat "$TMP_WORK/mpv.err" >&2
+            fi
+            msg "yt-dlp could not resolve a stream for: $_title"
+            return 3
+        fi
+        _video=$(printf '%s\n' "$_streams" | sed -n '1p' | tr -d '\r')
+        _audio=$(printf '%s\n' "$_streams" | sed -n '2p' | tr -d '\r')
+
+        set -- "--force-media-title=$_title"
+        if [ "$AUDIO" = 1 ]; then
+            set -- "$@" --no-video
+        else
+            set -- "$@" --force-window=yes
+            if [ -n "$_audio" ]; then
+                set -- "$@" "--audio-file=$_audio"
+            fi
+            if [ -n "$SUB_FILE" ]; then
+                set -- "$@" "--sub-file=$(native_path "$SUB_FILE")" \
+                    "--slang=$SUBS_LANG"
+            fi
+        fi
+        "$PLAYER" "$@" "$_video"
+        _rc=$?
+    fi
+
+    if [ "$_rc" -ne 0 ]; then
+        msg "playback failed ($_rc); the video may be unavailable, private, age-restricted, region-locked or removed."
+        return 3
+    fi
+    return 0
+}
+
+play_queue() {
+    _pl=$1
+    _total=$(wc -l <"$_pl" | tr -d ' ')
+    [ "$_total" -gt 0 ] || return 4
+    _idx=1
+
+    while [ "$_idx" -ge 1 ] && [ "$_idx" -le "$_total" ]; do
+        _line=$(sed -n "${_idx}p" "$_pl")
+        _url=$(printf '%s\n' "$_line" | cut -f1)
+        _title=$(printf '%s\n' "$_line" | cut -f2-)
+        if ! play "$_url" "$_title"; then
+            msg "skipping the unavailable item and moving on."
+        fi
+
+        [ "$_total" -gt 1 ] || break
+        if ! _action=$(printf '%s\n' \
+            'next	next video' \
+            'previous	previous video' \
+            'replay	replay this video' \
+            'select	select videos again' \
+            'quit	quit' |
+            pick "Playback" 0); then
+            break
+        fi
+        case $_action in
+            next*)
+                if [ "$_idx" -lt "$_total" ]; then
+                    _idx=$((_idx + 1))
+                else
+                    msg "end of queue"
+                    break
+                fi
+                ;;
+            previous*)
+                if [ "$_idx" -gt 1 ]; then
+                    _idx=$((_idx - 1))
+                else
+                    msg "already at the first item"
+                fi
+                ;;
+            replay*) : ;;
+            select*) return 2 ;;
+            quit*) break ;;
+        esac
+    done
+    return 0
+}
+
+download() {
+    _url=$1
+    _title=${2:-$1}
+    if ! mkdir -p "$DL_DIR" 2>/dev/null; then
+        msg "cannot create download directory: $DL_DIR"
+        return 1
+    fi
+
+    _dl_out="$(native_path "$DL_DIR")/%(title)s [%(id)s].%(ext)s"
+    set -- --no-playlist -o "$_dl_out"
+    if [ "$AUDIO" = 1 ]; then
+        if ! command -v ffmpeg >/dev/null 2>&1; then
+            msg "ffmpeg is required to extract audio; install it or drop --audio."
+            return 2
+        fi
+        set -- "$@" -f "$(yt_format)" -x --audio-format mp3
+    elif command -v ffmpeg >/dev/null 2>&1; then
+        set -- "$@" -f "$(yt_format)" --merge-output-format mp4
+    else
+        msg "ffmpeg not found; downloading a single-file format instead."
+        set -- "$@" -f "$(single_format)"
+    fi
+
+    if [ "$SUBS" = 1 ] && [ "$AUDIO" = 0 ]; then
+        set -- "$@" --write-subs --write-auto-subs --sub-langs "$SUBS_LANG"
+    fi
+
+    msg "downloading: $_title"
+    if ! ytdlp "$@" "$_url"; then
+        msg "download failed; the video may be unavailable, private, age-restricted, region-locked or removed."
+        return 3
+    fi
+    msg "saved under: $DL_DIR"
+    return 0
+}
+
+open_url() {
+    _open=$1
+    case $_open in
+        http://*|https://*) ;;
+        *)
+            msg "refusing to open a non-http link"
+            return 1
+            ;;
+    esac
+    if command -v termux-open >/dev/null 2>&1; then
+        termux-open "$_open"
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$_open" >/dev/null 2>&1
+    elif command -v open >/dev/null 2>&1; then
+        open "$_open" >/dev/null 2>&1
+    elif command -v rundll32.exe >/dev/null 2>&1; then
+        # Git Bash/MSYS has no xdg-open. rundll32 receives the URL as a single
+        # argument, so shell metacharacters in it are never re-parsed.
+        rundll32.exe url.dll,FileProtocolHandler "$_open" >/dev/null 2>&1
+    else
+        msg "no URL opener found; open this link manually: $_open"
+    fi
+}
+
+# -------------------------------- history ----------------------------------
+
+hist_add() {
+    [ "$USE_HISTORY" = 1 ] || return 0
+    _hmode=$(clean_field "$1")
+    _href=$(clean_field "$2")
+    _htitle=$(clean_field "$3")
+    _ts=$(date '+%Y-%m-%dT%H:%M:%S')
+
+    if ! mkdir -p "$HIST_DIR" 2>/dev/null; then
+        warn "cannot create history directory: $HIST_DIR"
+        return 0
+    fi
+
+    _htmp="$HISTFILE.tmp.$$"
+    HIST_TMP=$_htmp
+    {
+        printf '%s\t%s\t%s\t%s\n' "$_ts" "$_hmode" "$_href" "$_htitle"
+        if [ -f "$HISTFILE" ]; then
+            head -n 499 "$HISTFILE" || true
+        fi
+    } >"$_htmp" 2>/dev/null || {
+        rm -f "$_htmp"
+        HIST_TMP=
+        warn "could not update history"
+        return 0
+    }
+    if ! mv "$_htmp" "$HISTFILE" 2>/dev/null; then
+        rm -f "$_htmp"
+        HIST_TMP=
+        warn "could not update history"
+    fi
+    HIST_TMP=
+    return 0
+}
+
+hist_menu() {
+    if [ ! -s "$HISTFILE" ]; then
+        msg "History is empty."
+        return 4
+    fi
+    if ! _sel=$(awk -F "$TAB" -v OFS="$TAB" '
+        NF >= 4 { print $3, "[" $1 "] " $2 "  " $4 }' "$HISTFILE" |
+        pick "History" 0); then
+        return 0
+    fi
+    [ -n "$_sel" ] || return 0
+
+    _ref=$(printf '%s\n' "$_sel" | cut -f1)
+    _disp=$(printf '%s\n' "$_sel" | cut -f2-)
+    case $_ref in
+        anime:*)
+            _aid=${_ref#anime:}
+            case $_aid in
+                ''|*[!0-9]*)
+                    msg "malformed anime history entry"
+                    return 1
+                    ;;
+            esac
+            anime_menu "$_aid"
+            ;;
+        *)
+            if ! is_youtube_url "$_ref"; then
+                msg "history entry is not a YouTube URL; ignoring it."
+                return 1
+            fi
+            play "$_ref" "$_disp"
+            ;;
+    esac
+}
+
+# -------------------------------- AniList ----------------------------------
+
+ANILIST_URL=https://graphql.anilist.co
+ANILIST_FIELDS='
+    id
+    title { romaji english native }
+    format
+    episodes
+    seasonYear
+    averageScore
+    description(asHtml: false)
+    genres
+    studios(isMain: true) { nodes { name } }
+    status
+    nextAiringEpisode { airingAt episode }
+    trailer { id site }
+    externalLinks { site url type }
+'
+ANILIST_SEARCH_QUERY="query (\$search: String) {
+  Page(page: 1, perPage: 10) {
+    media(search: \$search, type: ANIME, isAdult: false, sort: SEARCH_MATCH) {
+      $ANILIST_FIELDS
+    }
+  }
+}"
+ANILIST_MEDIA_QUERY="query (\$id: Int) {
+  Media(id: \$id, type: ANIME) {
+    $ANILIST_FIELDS
+    streamingEpisodes { title url site }
+  }
+}"
+
+# jq -r stripped of CR so scalar values stay clean on systems whose jq
+# emits CRLF (notably Windows builds). This is a no-op on POSIX jq.
+jqtext() {
+    jq -r "$@" | tr -d '\r'
+}
+
+# Remove in-flight AniList files. cleanup() also covers them if the shell is
+# interrupted between mktemp and the request finishing.
+anilist_clear_tmp() {
+    [ -z "$ANILIST_TMP_OUT" ] || rm -f "$ANILIST_TMP_OUT"
+    [ -z "$ANILIST_TMP_HDR" ] || rm -f "$ANILIST_TMP_HDR"
+    ANILIST_TMP_OUT=
+    ANILIST_TMP_HDR=
+}
+
+# POST the query, cache the raw JSON for ten minutes, and retry once on a
+# short 429 Retry-After. No other retries and no API hammering.
+anilist_query() {
+    _aq_query=$1
+    _aq_vars=$2
+
+    if ! mkdir -p "$CACHE_DIR" 2>/dev/null; then
+        msg "cannot create AniList cache directory: $CACHE_DIR"
+        return 1
+    fi
+
+    _aq_key=$(printf '%s\n%s\n' "$_aq_query" "$_aq_vars" |
+        cksum | awk '{print $1 "-" $2}')
+    _aq_json="$CACHE_DIR/anilist-$_aq_key.json"
+    _aq_stamp="$CACHE_DIR/anilist-$_aq_key.ts"
+
+    _now=$(date +%s)
+    if [ -f "$_aq_json" ] && [ -f "$_aq_stamp" ]; then
+        _then=$(cat "$_aq_stamp" 2>/dev/null || printf '0')
+        case $_then in
+            ''|*[!0-9]*) _then=0 ;;
+        esac
+        _age=$((_now - _then))
+        if [ "$_age" -ge 0 ] && [ "$_age" -lt "$ANILIST_TTL" ]; then
+            cat "$_aq_json"
+            return 0
+        fi
+    fi
+
+    if ! _body=$(jq -n --arg query "$_aq_query" --argjson variables "$_aq_vars" \
+        '{query: $query, variables: $variables}'); then
+        msg "could not build the AniList request"
+        return 3
+    fi
+
+    _aq_out=$(mktemp "$CACHE_DIR/.anilist.XXXXXX") || {
+        msg "cannot create a temporary file for the AniList request"
+        return 1
+    }
+    _aq_hdr=$(mktemp "$CACHE_DIR/.anilist-hdr.XXXXXX") || {
+        rm -f "$_aq_out"
+        msg "cannot create a temporary file for the AniList request"
+        return 1
+    }
+    ANILIST_TMP_OUT=$_aq_out
+    ANILIST_TMP_HDR=$_aq_hdr
+
+    _attempt=1
+    _http=
+    while [ "$_attempt" -le 2 ]; do
+        _http=$(curl -sS --connect-timeout 10 --max-time 30 \
+            -D "$_aq_hdr" -o "$_aq_out" -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            -H 'Accept: application/json' -d "$_body" "$ANILIST_URL")
+        _rc=$?
+        if [ "$_rc" -ne 0 ]; then
+            anilist_clear_tmp
+            msg "could not reach AniList; check your connection and try again."
+            return 3
+        fi
+        [ "$_http" = 429 ] || break
+        if [ "$_attempt" -ge 2 ]; then
+            break
+        fi
+        _retry=$(awk 'tolower($1) == "retry-after:" { gsub("\r", "", $2); print $2 }' \
+            "$_aq_hdr" | tail -n 1)
+        case $_retry in
+            ''|*[!0-9]*) _retry=5 ;;
+        esac
+        if [ "$_retry" -gt 30 ]; then
+            anilist_clear_tmp
+            msg "AniList rate limit reached; try again in ${_retry} seconds."
+            return 3
+        fi
+        msg "AniList rate limit reached; retrying once in ${_retry}s."
+        sleep "$_retry"
+        _attempt=$((_attempt + 1))
+    done
+
+    if [ "$_http" != 200 ]; then
+        _gqerr=
+        if jq -e . "$_aq_out" >/dev/null 2>&1; then
+            _gqerr=$(jqtext '.errors[0].message // empty' "$_aq_out" 2>/dev/null)
+        fi
+        anilist_clear_tmp
+        if [ "$_http" = 429 ]; then
+            msg "AniList is rate limiting requests; try again in a few minutes."
+        elif [ -n "$_gqerr" ]; then
+            msg "AniList error: $_gqerr"
+        else
+            msg "AniList is unavailable (HTTP $_http); try again later."
+        fi
+        return 3
+    fi
+
+    if ! jq -e . "$_aq_out" >/dev/null 2>&1; then
+        anilist_clear_tmp
+        msg "AniList returned an unreadable response."
+        return 3
+    fi
+
+    if jq -e '.errors and (.errors | length > 0)' "$_aq_out" >/dev/null 2>&1; then
+        _gqerr=$(jqtext '.errors[0].message // "unknown error"' "$_aq_out")
+        anilist_clear_tmp
+        msg "AniList error: $_gqerr"
+        return 3
+    fi
+
+    rm -f "$_aq_hdr"
+    ANILIST_TMP_HDR=
+    if ! mv "$_aq_out" "$_aq_json" 2>/dev/null; then
+        anilist_clear_tmp
+        rm -f "$_aq_stamp"
+        msg "could not write the AniList cache"
+        return 1
+    fi
+    ANILIST_TMP_OUT=
+    if ! printf '%s\n' "$(date +%s)" >"$_aq_stamp" 2>/dev/null; then
+        rm -f "$_aq_stamp"
+    fi
+    cat "$_aq_json"
+}
+
+anilist_search() {
+    _as_query=$1
+    _as_vars=$(jq -n --arg search "$_as_query" '{search: $search}') || {
+        msg "could not build the AniList search"
+        return 3
+    }
+    _as_json=$(anilist_query "$ANILIST_SEARCH_QUERY" "$_as_vars") || return $?
+
+    _as_lines=$(printf '%s\n' "$_as_json" | jq -r '
+        .data.Page.media[]? |
+        (.title.romaji // .title.english // .title.native // "?") as $r |
+        (.title.english // "") as $e |
+        [ (.id | tostring),
+          (if $e != "" and $e != $r then "\($r) (\($e))" else $r end)
+          + " | " + ((.format // "?") | gsub("_"; " "))
+          + " | " + ((.episodes // "?") | tostring)
+          + " | " + ((.seasonYear // "?") | tostring)
+          + " | " + ((.averageScore // "?") | tostring)
+        ] | @tsv' 2>/dev/null | tr -d '\r')
+
+    if [ -z "$_as_lines" ]; then
+        msg "No anime found for: $_as_query"
+        return 4
+    fi
+    printf '%s\n' "$_as_lines"
+}
+
+anilist_media() {
+    _am_id=$1
+    case $_am_id in
+        ''|*[!0-9]*)
+            msg "invalid AniList media id"
+            return 1
+            ;;
+    esac
+    _am_vars=$(jq -n --argjson id "$_am_id" '{id: $id}') || return 3
+    anilist_query "$ANILIST_MEDIA_QUERY" "$_am_vars"
+}
+
+format_epoch() {
+    _epoch=$1
+    if date -d "@$_epoch" '+%Y-%m-%d %H:%M %Z' >/dev/null 2>&1; then
+        date -d "@$_epoch" '+%Y-%m-%d %H:%M %Z'
+    elif date -r "$_epoch" '+%Y-%m-%d %H:%M %Z' >/dev/null 2>&1; then
+        date -r "$_epoch" '+%Y-%m-%d %H:%M %Z'
+    else
+        printf '%s (epoch)\n' "$_epoch"
+    fi
+}
+
+anime_links() {
+    _alk_json=$1
+    _alk_file=$TMP_WORK/anime-links.tsv
+    jqtext '.data.Media.externalLinks[]? |
+        select(.type == "STREAMING") | [.site, .url] | @tsv' \
+        "$_alk_json" >"$_alk_file" 2>/dev/null
+
+    if [ ! -s "$_alk_file" ]; then
+        msg "AniList lists no official streaming links for this title."
+        return 4
+    fi
+
+    printf '\n%sOfficial streaming links (from AniList):%s\n' "$C_BOLD" "$C_RESET"
+    while IFS="$TAB" read -r _alk_site _alk_url; do
+        printf '  - %s: %s\n' "$_alk_site" "$_alk_url"
+    done <"$_alk_file"
+
+    if ! _sel=$(awk -F "$TAB" -v OFS="$TAB" \
+        '{ print $2, $1 " - " $2 }' "$_alk_file" |
+        pick "Open official link" 0); then
+        return 0
+    fi
+    [ -n "$_sel" ] || return 0
+
+    _alk_open=$(printf '%s\n' "$_sel" | cut -f1)
+    case $_alk_open in
+        http://*|https://*) ;;
+        *)
+            msg "AniList returned a link that is not http(s); refusing to open it."
+            return 1
+            ;;
+    esac
+    open_url "$_alk_open"
+}
+
+# Official per-episode links published by AniList. YouTube episodes can be
+# played here; links to licensed services open in the user's browser.
+anime_episodes() {
+    _aep_json=$1
+    _aep_file=$TMP_WORK/anime-episodes.tsv
+    jqtext '.data.Media.streamingEpisodes[]? |
+        select((.url // "") | test("^https?://")) |
+        [.url, ((.site // "?") + " - " + (.title // .url))] | @tsv' \
+        "$_aep_json" >"$_aep_file" 2>/dev/null
+
+    if [ ! -s "$_aep_file" ]; then
+        msg "AniList lists no official per-episode links for this title."
+        msg "Use 'Open legal streaming links' to browse the service instead."
+        return 4
+    fi
+
+    _aep_count=$(wc -l <"$_aep_file" | tr -d ' ')
+    printf '\n%sOfficial episodes (from AniList):%s %s\n' \
+        "$C_BOLD" "$C_RESET" "$_aep_count"
+    printf 'YouTube episodes play here; other services open in your browser.\n'
+
+    if ! _sel=$(pick "Episode" 0 <"$_aep_file"); then
+        return 0
+    fi
+    [ -n "$_sel" ] || return 0
+
+    _aep_url=$(printf '%s\n' "$_sel" | cut -f1)
+    _aep_disp=$(printf '%s\n' "$_sel" | cut -f2-)
+    case $_aep_url in
+        http://*|https://*) ;;
+        *)
+            msg "AniList returned a link that is not http(s); refusing to use it."
+            return 1
+            ;;
+    esac
+
+    if is_youtube_url "$_aep_url"; then
+        hist_add youtube "$_aep_url" "$_aep_disp"
+        if [ "$DOWNLOAD" = 1 ]; then
+            download "$_aep_url" "$_aep_disp"
+        else
+            play "$_aep_url" "$_aep_disp"
+        fi
+    else
+        msg "opening: $_aep_disp"
+        open_url "$_aep_url"
+    fi
+}
+
+anime_menu() {
+    _menu_id=$1
+    _json=$TMP_WORK/anime.json
+    anilist_media "$_menu_id" >"$_json"
+    _menu_rc=$?
+    [ "$_menu_rc" -eq 0 ] || return "$_menu_rc"
+    if ! jq -e '.data.Media.id != null' "$_json" >/dev/null 2>&1; then
+        msg "AniList has no anime with id $_menu_id."
+        return 4
+    fi
+
+    _title=$(jqtext '(.data.Media.title.romaji //
+        .data.Media.title.english // .data.Media.title.native // "?")' "$_json")
+    _english=$(jqtext '.data.Media.title.english // ""' "$_json")
+    _format=$(jqtext '(.data.Media.format // "?") | gsub("_"; " ")' "$_json")
+    _episodes=$(jqtext '.data.Media.episodes // "?"' "$_json")
+    _year=$(jqtext '.data.Media.seasonYear // "?"' "$_json")
+    _score=$(jqtext '.data.Media.averageScore // "?"' "$_json")
+    _status=$(jqtext '(.data.Media.status // "?") | gsub("_"; " ")' "$_json")
+    _genres=$(jqtext '(.data.Media.genres // []) | join(", ")' "$_json")
+    _studios=$(jqtext '(.data.Media.studios.nodes // []) | map(.name) | join(", ")' "$_json")
+    _syn=$(jqtext '
+        .data.Media.description // "" |
+        gsub("<br\\s*/?>"; "\n") |
+        gsub("<[^>]*>"; "") |
+        gsub("&quot;"; "\"") |
+        gsub("&#0?39;"; "\u0027") |
+        gsub("&lt;"; "<") |
+        gsub("&gt;"; ">") |
+        gsub("&amp;"; "&")' "$_json")
+
+    [ -n "$_english" ] && [ "$_english" != "$_title" ] && _title="$_title ($_english)"
+    [ -n "$_genres" ] || _genres="?"
+    [ -n "$_studios" ] || _studios="?"
+    [ -n "$_format" ] || _format="?"
+
+    hist_add anime "anime:$_menu_id" "$_title"
+
+    printf '\n%s%s%s\n' "$C_BOLD" "$_title" "$C_RESET"
+    printf 'Format:      %s\n' "$_format"
+    printf 'Episodes:    %s\n' "$_episodes"
+    printf 'Season:      %s\n' "$_year"
+    printf 'Score:       %s\n' "$_score"
+    printf 'Status:      %s\n' "$_status"
+    printf 'Studios:     %s\n' "$_studios"
+    printf 'Genres:      %s\n' "$_genres"
+
+    _next=$(jqtext 'if .data.Media.nextAiringEpisode then
+        "\(.data.Media.nextAiringEpisode.episode)\t\(.data.Media.nextAiringEpisode.airingAt)"
+        else empty end' "$_json")
+    if [ -n "$_next" ]; then
+        _next_ep=${_next%%"$TAB"*}
+        _next_at=${_next#*"$TAB"}
+        printf 'Next airing: episode %s at %s\n' "$_next_ep" "$(format_epoch "$_next_at")"
+    else
+        printf 'Next airing: not scheduled\n'
+    fi
+
+    printf '\n%sSynopsis:%s\n' "$C_BOLD" "$C_RESET"
+    if [ -n "$_syn" ]; then
+        printf '%s\n' "$_syn"
+    else
+        printf '(no synopsis)\n'
+    fi
+
+    _ep_total=$(jqtext '.data.Media.streamingEpisodes // [] | length' "$_json")
+    case $_ep_total in
+        ''|*[!0-9]*) _ep_total=0 ;;
+    esac
+    if [ "$_ep_total" -gt 0 ]; then
+        _ep_label="1. Browse official episodes ($_ep_total)"
+    else
+        _ep_label="1. Browse official episodes"
+    fi
+
+    while :; do
+        if ! _choice=$(printf '%s\n' \
+            "episodes	$_ep_label" \
+            'trailer	2. Play official trailer' \
+            'links	3. Open legal streaming links' \
+            'search	4. Search YouTube for official clips/PVs' \
+            'quit	5. Quit' |
+            pick "Anime" 0); then
+            return 0
+        fi
+        [ -n "$_choice" ] || return 0
+        _action=$(printf '%s\n' "$_choice" | cut -f1)
+
+        case $_action in
+            episodes)
+                anime_episodes "$_json"
+                ;;
+            trailer)
+                _tsite=$(jqtext '.data.Media.trailer.site // empty' "$_json")
+                _tid=$(jqtext '.data.Media.trailer.id // empty' "$_json")
+                if [ -z "$_tsite" ] || [ -z "$_tid" ]; then
+                    msg "AniList lists no official trailer for this title."
+                elif [ "$_tsite" != youtube ]; then
+                    msg "The trailer is hosted on $_tsite; vid-cli only plays YouTube trailers."
+                else
+                    case $_tid in
+                        *[!A-Za-z0-9_-]*)
+                            msg "AniList returned a malformed trailer id; refusing to use it."
+                            ;;
+                        *)
+                            _turl="https://www.youtube.com/watch?v=$_tid"
+                            hist_add youtube "$_turl" "Trailer: $_title"
+                            play "$_turl" "Trailer: $_title"
+                            ;;
+                    esac
+                fi
+                ;;
+            links)
+                anime_links "$_json"
+                ;;
+            search)
+                _sq=$(clean_field "$_title official PV")
+                _results=$(yt_search "$_sq")
+                _yrc=$?
+                if [ "$_yrc" -ne 0 ]; then
+                    :
+                elif _picked=$(printf '%s\n' "$_results" | pick "YouTube" 0); then
+                    if [ -n "$_picked" ]; then
+                        _vid=$(printf '%s\n' "$_picked" | cut -f1)
+                        _vdisp=$(printf '%s\n' "$_picked" | cut -f2-)
+                        if _vurl=$(video_url "$_vid"); then
+                            hist_add youtube "$_vurl" "$_vdisp"
+                            if [ "$DOWNLOAD" = 1 ]; then
+                                download "$_vurl" "$_vdisp"
+                            else
+                                play "$_vurl" "$_vdisp"
+                            fi
+                        else
+                            msg "yt-dlp returned an unexpected video id; skipping it."
+                        fi
+                    fi
+                fi
+                ;;
+            quit)
+                return 0
+                ;;
+        esac
+    done
+}
+
+anime_search() {
+    _anq=$1
+    _lines=$(anilist_search "$_anq")
+    _arc=$?
+    [ "$_arc" -eq 0 ] || return "$_arc"
+
+    if ! _sel=$(printf '%s\n' "$_lines" | pick "Anime" 0); then
+        return 0
+    fi
+    [ -n "$_sel" ] || return 0
+    _id=$(printf '%s\n' "$_sel" | cut -f1)
+    case $_id in
+        ''|*[!0-9]*)
+            msg "AniList returned an unexpected media id; skipping it."
+            return 3
+            ;;
+    esac
+    anime_menu "$_id"
+}
+
+# ------------------------------- YouTube flow ------------------------------
+
+youtube_search_flow() {
+    _yq=$1
+    _lines=$(yt_search "$_yq")
+    _yrc=$?
+    [ "$_yrc" -eq 0 ] || return "$_yrc"
+
+    if ! _sel=$(printf '%s\n' "$_lines" | pick "YouTube" 0); then
+        return 0
+    fi
+    [ -n "$_sel" ] || return 0
+
+    _id=$(printf '%s\n' "$_sel" | cut -f1)
+    _disp=$(printf '%s\n' "$_sel" | cut -f2-)
+    if ! _vurl=$(video_url "$_id"); then
+        msg "yt-dlp returned an unexpected video id; refusing to use it."
+        return 3
+    fi
+    hist_add youtube "$_vurl" "$_disp"
+    if [ "$DOWNLOAD" = 1 ]; then
+        download "$_vurl" "$_disp"
+        return $?
+    fi
+    play "$_vurl" "$_disp"
+}
+
+youtube_flow() {
+    _yf_query=${1:-$QUERY}
+    case $_yf_query in
+        *://*|youtu.be/*|youtube.com/*|www.youtube.com/*|m.youtube.com/*|music.youtube.com/*)
+            _url=$(normalize_url "$_yf_query")
+            if ! is_youtube_url "$_url"; then
+                msg "only YouTube URLs are supported (youtube.com, youtu.be, music.youtube.com)"
+                return 1
+            fi
+            yt_expand_url "$_url"
+            ;;
+        *)
+            youtube_search_flow "$_yf_query"
+            ;;
+    esac
+}
+
+# Landing page shown when vid-cli is started without a query.
+home_menu() {
+    if [ -s "$HISTFILE" ]; then
+        _home_hist=$(wc -l <"$HISTFILE" | tr -d ' ')
+    else
+        _home_hist=0
+    fi
+    _home_mode=
+    [ "$DOWNLOAD" = 1 ] && _home_mode=' | download mode'
+
+    printf '\n%s  vid-cli %s%s\n' "$C_BOLD" "$VERSION" "$C_RESET"
+    printf '  YouTube + anime, in your terminal\n'
+    printf '  ------------------------------------\n'
+    printf '  Quality: %s | Player: %s | History: %s%s\n' \
+        "$QUALITY" "$PLAYER_KIND" "$_home_hist" "$_home_mode"
+    printf '  Tip: paste a YouTube URL or type a search.\n\n'
+
+    while :; do
+        if ! _home_choice=$(printf '%s\n' \
+            'youtube	1. Search YouTube' \
+            'anime	2. Search anime (AniList)' \
+            'history	3. Continue from history' \
+            'quit	4. Quit' |
+            pick "vid-cli" 0); then
+            return 0
+        fi
+        [ -n "$_home_choice" ] || return 0
+        _home_action=$(printf '%s\n' "$_home_choice" | cut -f1)
+
+        case $_home_action in
+            youtube)
+                _home_q=$(ask "Search YouTube")
+                [ -n "$_home_q" ] || continue
+                youtube_flow "$_home_q"
+                ;;
+            anime)
+                _home_q=$(ask "Search anime")
+                [ -n "$_home_q" ] || continue
+                anime_search "$_home_q"
+                ;;
+            history)
+                hist_menu
+                ;;
+            quit)
+                return 0
+                ;;
+        esac
+    done
+}
+
+# ---------------------------------- main -----------------------------------
+
+main() {
+    parse_args "$@"
+
+    if [ "$CONTINUE" = 1 ]; then
+        check_deps
+        init_work
+        hist_menu
+        exit $?
+    fi
+
+    if [ "$MODE" = anime ]; then
+        if [ -z "$QUERY" ]; then
+            if [ "$EXTERNAL_MENU" != 1 ] && [ ! -t 0 ]; then
+                usage >&2
+                exit 1
+            fi
+            check_deps
+            init_work
+            _title=$(ask "Search anime")
+            [ -n "$_title" ] || exit 0
+            anime_search "$_title"
+            exit $?
+        fi
+        check_deps
+        init_work
+        anime_search "$QUERY"
+        exit $?
+    fi
+
+    if [ -z "$QUERY" ]; then
+        if [ "$EXTERNAL_MENU" != 1 ] && [ ! -t 0 ]; then
+            usage >&2
+            exit 1
+        fi
+        check_deps
+        init_work
+        home_menu
+        exit $?
+    fi
+
+    check_deps
+    init_work
+    youtube_flow
+    exit $?
+}
+
+if [ "${VID_CLI_SOURCE_ONLY:-0}" != 1 ]; then
+    main "$@"
+fi
+

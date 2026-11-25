@@ -1,0 +1,149 @@
+{
+  "data": {
+    "Page": {
+      "media": [
+        {
+          "id": 1,
+          "title": {
+            "romaji": "Cowboy Bebop",
+            "english": "Cowboy Bebop",
+            "native": "カウボーイビバップ"
+          },
+          "format": "TV",
+          "episodes": 26,
+          "seasonYear": 1998,
+          "averageScore": 86,
+          "description": "A ragtag crew of bounty hunters <i>drifts</i> through space.<br><br>Jazz, bounty hunting &amp; pasts collide &quot;nicely&quot;.",
+          "genres": ["Action", "Award Winning", "Sci-Fi"],
+          "studios": {
+            "nodes": [
+              {"name": "Sunrise"}
+            ]
+          },
+          "status": "FINISHED",
+          "nextAiringEpisode": null,
+          "trailer": {
+            "id": "qig4KOK2R2g",
+            "site": "youtube"
+          },
+          "externalLinks": [
+            {
+              "site": "Crunchyroll",
+              "url": "https://www.crunchyroll.com/series/GRGG9798R/cowboy-bebop",
+              "type": "STREAMING"
+            },
+            {
+              "site": "Netflix",
+              "url": "https://www.netflix.com/title/80001309",
+              "type": "STREAMING"
+            },
+            {
+              "site": "Wikipedia",
+              "url": "https://en.wikipedia.org/wiki/Cowboy_Bebop",
+              "type": "INFO"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "title": {
+            "romaji": "Shingeki no Kyojin",
+            "english": "Attack on Titan",
+            "native": "進撃の巨人"
+          },
+          "format": "TV",
+          "episodes": 25,
+          "seasonYear": 2013,
+          "averageScore": 84,
+          "description": "Humanity fights for survival behind enormous walls.",
+          "genres": ["Action", "Drama", "Fantasy"],
+          "studios": {
+            "nodes": [
+              {"name": "Wit Studio"}
+            ]
+          },
+          "status": "FINISHED",
+          "nextAiringEpisode": null,
+          "trailer": {
+            "id": "MGRm4IzK1SQ",
+            "site": "youtube"
+          },
+          "externalLinks": [
+            {
+              "site": "Crunchyroll",
+              "url": "https://www.crunchyroll.com/series/GR751KNZY/attack-on-titan",
+              "type": "STREAMING"
+            },
+            {
+              "site": "Hulu",
+              "url": "https://www.hulu.com/series/attack-on-titan",
+              "type": "STREAMING"
+            }
+          ]
+        }
+      ]
+    },
+    "Media": {
+      "id": 1,
+      "title": {
+        "romaji": "Cowboy Bebop",
+        "english": "Cowboy Bebop",
+        "native": "カウボーイビバップ"
+      },
+      "format": "TV",
+      "episodes": 26,
+      "seasonYear": 1998,
+      "averageScore": 86,
+      "description": "A ragtag crew of bounty hunters <i>drifts</i> through space.<br><br>Jazz, bounty hunting &amp; pasts collide &quot;nicely&quot;.",
+      "genres": ["Action", "Award Winning", "Sci-Fi"],
+      "studios": {
+        "nodes": [
+          {"name": "Sunrise"}
+        ]
+      },
+      "status": "RELEASING",
+      "nextAiringEpisode": {
+        "airingAt": 1735689600,
+        "episode": 27
+      },
+      "trailer": {
+        "id": "qig4KOK2R2g",
+        "site": "youtube"
+      },
+      "externalLinks": [
+        {
+          "site": "Crunchyroll",
+          "url": "https://www.crunchyroll.com/series/GRGG9798R/cowboy-bebop",
+          "type": "STREAMING"
+        },
+        {
+          "site": "Netflix",
+          "url": "https://www.netflix.com/title/80001309",
+          "type": "STREAMING"
+        },
+        {
+          "site": "Wikipedia",
+          "url": "https://en.wikipedia.org/wiki/Cowboy_Bebop",
+          "type": "INFO"
+        }
+      ],
+      "streamingEpisodes": [
+        {
+          "title": "Episode 1 - Asteroid Blues",
+          "url": "https://www.crunchyroll.com/watch/G7PU4VJEJ/asteroid-blues",
+          "site": "Crunchyroll"
+        },
+        {
+          "title": "Episode 2 - Stray Dog Strut",
+          "url": "https://www.crunchyroll.com/watch/GX9UQ7ZXW/stray-dog-strut",
+          "site": "Crunchyroll"
+        },
+        {
+          "title": "Episode 1 - Official preview",
+          "url": "https://www.youtube.com/watch?v=episode1234",
+          "site": "YouTube"
+        }
+      ]
+    }
+  }
+}

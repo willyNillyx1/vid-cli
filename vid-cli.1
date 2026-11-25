@@ -1,0 +1,265 @@
+.TH VID-CLI 1 "2026-11-18" "vid-cli 1.0.0" "User Commands"
+.SH NAME
+vid-cli \- search, play and download YouTube videos, and browse anime metadata
+.SH SYNOPSIS
+.B vid-cli
+.RI [ options ]
+.I QUERY
+.RI | " URL"
+.br
+.B vid-cli
+.RI [ options ]
+.br
+.B vid-cli
+.RI [ options ]
+.B \-c
+.br
+.B vid-cli
+.B \-\-anime
+.RI [ options ]
+.I TITLE
+.br
+.B vid-cli
+.BR \-h " | " \-V " | " \-U
+.SH DESCRIPTION
+.B vid-cli
+is a small terminal front end for
+.BR yt-dlp (1)
+and
+.BR mpv (1).
+Searches are performed by yt-dlp using its
+.B ytsearch
+pseudo-URL. Playback is delegated to mpv after yt-dlp resolves the stream.
+A pasted YouTube video, playlist or channel URL is handled directly.
+Playlists and channels open a multi-select menu; selected videos are
+queued and played in order.
+.PP
+With no query, the program opens a startup page when standard input is a
+terminal, or when
+.B VID_CLI_EXTERNAL_MENU
+is set to
+.BR 1 .
+The page shows the current quality, player and history count, then offers
+YouTube search, anime search, history and quit. Without a terminal, no
+query prints usage and exits with status 1.
+.PP
+With
+.BR \-\-anime ,
+metadata, trailers, per-episode links and official streaming links are read
+from the public AniList GraphQL API. No other anime site is contacted. Anime
+mode prints only AniList data, plays only YouTube episodes and trailers, and
+opens only links that AniList marks as official. When
+.B \-\-anime
+is given without a title, the program prompts for one on a terminal; without
+a terminal it prints usage and exits 1.
+.PP
+The program never updates itself and never installs software. It writes
+only to the XDG state/cache directories, temporary files under the cache
+directory, and the download directory.
+.SH OPTIONS
+.TP
+.BR \-q ", " \-\-quality " " LEVEL
+Select 360, 480, 720, 1080,
+.B best
+or
+.BR worst .
+The default is
+.BR 720 .
+The value is mapped to a yt-dlp format string.
+.TP
+.BR \-a ", " \-\-audio
+Audio only. mpv is started with
+.BR \-\-no\-video ;
+downloads use
+.BR yt\-dlp " \-x".
+Audio downloads require ffmpeg.
+.TP
+.BR \-d ", " \-\-download
+Download instead of playing. Files go to
+.B VID_CLI_DL_DIR
+(default
+.IR $HOME/Videos/vid-cli ).
+.TP
+.BR \-n ", " \-\-number " " N
+Number of search results to request. The default is 15.
+.TP
+.BR \-c ", " \-\-continue
+Show the history menu, newest first, and replay the selected item.
+History entries can also reopen an anime information screen.
+.TP
+.BR \-\-subs [= LANG ]
+Load subtitles when available. The default language is
+.BR en .
+Use
+.B \-\-subs=fr
+or
+.B \-\-subs fr
+to choose another language. If the query itself starts with a token that
+looks like a language code, put
+.B \-\-
+before it. Subtitle files are downloaded by yt-dlp into the temporary
+cache directory and passed to the player.
+.TP
+.BR \-\-sort " " MODE
+Sort search results by
+.BR relevance ,
+.B date
+or
+.BR views .
+The date mode uses the yt-dlp
+.B ytsearchdate
+filter. The views mode sorts on the client because YouTube search has
+no views filter; a message says so.
+.TP
+.B \-\-no\-history
+Do not write to the history file.
+.TP
+.BR \-v ", " \-\-vlc
+Use VLC instead of mpv. The stream is resolved by yt-dlp, so all YouTube
+access still goes through yt-dlp. For adaptive video, mpv receives the audio
+URL with its audio-file option; VLC mode uses a single-file stream.
+.TP
+.B \-\-anime
+Anime mode. The remaining argument is an anime title, searched on AniList.
+On a terminal, a missing title is requested with a free-text prompt.
+.TP
+.BR \-h ", " \-\-help
+Print usage, all flags and all environment variables, then exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.TP
+.BR \-U ", " \-\-update
+Print update instructions and exit. The script does not modify itself.
+.TP
+.B \-\-
+End option parsing. Useful when a query begins with a hyphen.
+.SH ANIME MODE
+Searches AniList and displays matches as:
+.IP
+romaji title (English title) | format | episodes | season year | score
+.PP
+After a selection, an information screen shows the synopsis with HTML
+stripped, genres, studio, status and the next airing episode converted
+to local time. The action menu offers:
+.IP "1." 4
+Browse official episodes from AniList's
+.B streamingEpisodes
+list. YouTube episodes are played locally; links to licensed services
+open in the browser. When AniList has no per-episode links, a message
+points to the series-level links instead.
+.IP "2." 4
+Play the official trailer. Only trailers whose AniList site is YouTube
+are played.
+.IP "3." 4
+Print and open the official streaming links returned by AniList
+.RB ( type " == " STREAMING ).
+.IP "4." 4
+Search YouTube for official clips or promotional videos using the title
+plus
+.BR "official PV" .
+.IP "5." 4
+Quit.
+.PP
+AniList responses are cached for ten minutes under
+.IR $XDG_CACHE_HOME/vid-cli .
+A 429 response is retried at most once, with a short delay: a numeric
+Retry-After value of 30 seconds or less is honoured, and a missing or
+non-numeric value defaults to 5 seconds. Longer limits are not retried.
+.SH ENVIRONMENT
+.TP
+.B VID_CLI_PLAYER
+Player binary. The default is
+.BR mpv .
+A binary whose name contains
+.B vlc
+is driven in VLC mode.
+.TP
+.B VID_CLI_DL_DIR
+Download directory. The default is
+.IR $HOME/Videos/vid-cli .
+.TP
+.B VID_CLI_HIST_DIR
+State directory for the history file. The default is
+.IR ${XDG_STATE_HOME:-$HOME/.local/state}/vid-cli .
+.TP
+.B VID_CLI_RESULTS
+Default number of search results. The default is 15.
+.TP
+.B VID_CLI_EXTERNAL_MENU
+Use rofi instead of fzf when set to
+.BR 1 .
+If rofi is missing, fzf is used and a warning is printed.
+.TP
+.B VID_CLI_YTDLP_ARGS
+Extra arguments passed to yt-dlp, split on whitespace. Example:
+.BR "\-\-limit\-rate 2M" .
+Globbing is disabled before the split. The tool itself adds no login,
+paywall, DRM or region workarounds.
+.TP
+.B NO_COLOR
+When set, even to an empty value, ANSI colors are disabled. Colors are
+also disabled when stdout is not a terminal.
+.SH FILES
+.TP
+.I $XDG_CACHE_HOME/vid-cli/
+AniList response cache, cache stamps and temporary work directories.
+.TP
+.I $XDG_STATE_HOME/vid-cli/histfile
+Tab-separated history: timestamp, mode, id-or-URL, title. Newest first,
+capped at 500 lines.
+.TP
+.I $HOME/Videos/vid-cli/
+Default download directory.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, or the user cancelled a menu.
+.TP
+.B 1
+Usage error, bad option, or an unsupported URL.
+.TP
+.B 2
+A required dependency is missing.
+.TP
+.B 3
+Network or API failure, or playback/download failed.
+.TP
+.B 4
+Nothing found.
+.SH EXAMPLES
+.TP
+.B vid-cli
+Open the startup page in a terminal.
+.TP
+.B vid-cli \-\-anime
+Prompt for an anime title on a terminal.
+.TP
+.B vid-cli "lofi hip hop"
+Search and play.
+.TP
+.B vid-cli \-q 720 \-a "jazz"
+Audio-only playback, requesting a 720p video format is ignored for
+audio.
+.TP
+.B vid-cli \-d \-\-subs "conference talk"
+Download a video and its subtitles.
+.TP
+.B vid-cli "https://www.youtube.com/playlist?list=..."
+Expand a playlist and multi-select videos.
+.TP
+.B vid-cli \-c
+Replay from history.
+.TP
+.B vid-cli \-\-anime "Cowboy Bebop"
+Browse AniList metadata and official links.
+.SH LEGAL
+The user is responsible for complying with YouTube's Terms of Service
+and with local copyright law. vid-cli is for personal use. It does not
+host, mirror or redistribute any content. It does not bypass paywalls,
+DRM, login walls or geographic restrictions.
+.SH SEE ALSO
+.BR yt\-dlp (1),
+.BR mpv (1),
+.BR fzf (1),
+.BR jq (1)
